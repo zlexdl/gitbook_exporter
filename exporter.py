@@ -2,7 +2,7 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import time
 from langchain_community.document_loaders import GitbookLoader
 
@@ -15,6 +15,7 @@ class GitBookExporter:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
         })
+        self.visited = set()
 
     def get_soup(self, url):
         try:
@@ -25,16 +26,22 @@ class GitBookExporter:
             print(f"Error fetching {url}: {e}")
             return None
 
+    def clean_url(self, url):
+        parsed = urlparse(url)
+        # Keep scheme, netloc, and path. Remove params, query, fragment
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    def is_internal(self, url):
+        return urlparse(url).netloc == self.domain
+
     def extract_content(self, soup):
         # Try to find the main content area
         content = soup.find('main') or soup.find('article') or soup.find('div', class_='page-inner') or soup.find('div', id='book-search-results')
         
         if not content:
             # Fallback: try to find the biggest div?
-            # Or just return the body
-            content = soup.body
-        
-        if not content:
+            # Or just return the body if it's small enough?
+            # For now, let's be conservative
             return None, None
 
         # Convert to HTML string
@@ -48,11 +55,23 @@ class GitBookExporter:
         markdown_content = md(str(content))
         return html_content, markdown_content
 
-    def save_content(self, url, html_content, markdown_content):
-        # Determine file path based on URL
-        # Handle cases where url might not start with base_url (if redirected or something)
-        # But GitbookLoader usually returns correct URLs
+    def extract_links(self, soup, current_url):
+        links = set()
+        # Strategy 1: Look for 'nav'
+        nav = soup.find('nav')
+        if nav:
+            for a in nav.find_all('a', href=True):
+                href = a['href']
+                full_url = urljoin(current_url, href)
+                if self.is_internal(full_url):
+                    links.add(self.clean_url(full_url))
         
+        # Strategy 2: If no nav, or to be safe, look for sidebar classes
+        # (This is a backup, usually nav covers it)
+        
+        return list(links)
+
+    def save_content(self, url, html_content, markdown_content):
         parsed_url = urlparse(url)
         path = parsed_url.path
         
@@ -87,13 +106,45 @@ class GitBookExporter:
             
         print(f"Saved {url} to {path}")
 
+    def run_fallback(self):
+        print("Falling back to recursive crawling...")
+        queue = [self.base_url]
+        self.visited.add(self.clean_url(self.base_url))
+        
+        while queue:
+            current_url = queue.pop(0)
+            print(f"Processing {current_url}...")
+            
+            soup = self.get_soup(current_url)
+            if not soup:
+                continue
+                
+            html_content, markdown_content = self.extract_content(soup)
+            if html_content:
+                self.save_content(current_url, html_content, markdown_content)
+            
+            # Find new links
+            links = self.extract_links(soup, current_url)
+            for link in links:
+                cleaned_link = self.clean_url(link)
+                if cleaned_link not in self.visited:
+                    self.visited.add(cleaned_link)
+                    queue.append(cleaned_link)
+            
+            time.sleep(0.2)
+
     def run(self):
         print(f"Discovering pages from {self.base_url} using GitbookLoader...")
+        documents = []
         try:
             loader = GitbookLoader(self.base_url, load_all_paths=True)
             documents = loader.load()
         except Exception as e:
-            print(f"Error loading GitBook: {e}")
+            print(f"GitbookLoader failed: {e}")
+        
+        if not documents:
+            print("No documents found with GitbookLoader (possibly missing sitemap).")
+            self.run_fallback()
             return
 
         print(f"Found {len(documents)} pages. Starting export...")
@@ -112,5 +163,5 @@ class GitBookExporter:
             if html_content:
                 self.save_content(url, html_content, markdown_content)
             
-            time.sleep(0.2) # Be polite
+            time.sleep(0.2)
 
